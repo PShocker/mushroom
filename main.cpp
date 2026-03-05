@@ -12,17 +12,18 @@ static uv_loop_t *loop = nullptr;
 
 static std::vector<ipClient> clients;
 
-static bool sendUDP(const uint8_t *data, size_t length, ipClient &client) {
-  // 3. 准备目标地址（用于发送）
+static bool sendUDP(uint8_t *data, size_t len, uint32_t ip, uint16_t port) {
   uv_udp_send_t *send_req = (uv_udp_send_t *)malloc(sizeof(uv_udp_send_t));
-  sockaddr_in send_addr = {};
-  uv_ip4_addr(client.ip.c_str(), client.port, &send_addr);
+  sockaddr_in send_addr;
+  send_addr.sin_family = AF_INET;
+  send_addr.sin_port = htons(port);
+  send_addr.sin_addr.s_addr = ip;
 
-  uv_buf_t buf = uv_buf_init((char *)data, length);
+  uv_buf_t buf = uv_buf_init((char *)data, len);
 
   // 使用在 main 中初始化好的目标地址 send_addr
   auto r = uv_udp_send(
-      send_req, &server_socket, &buf, 1, (const struct sockaddr *)&send_addr,
+      send_req, &server_socket, &buf, 1, (const sockaddr *)&send_addr,
       [](uv_udp_send_t *req, int status) {
         if (status < 0) {
           fprintf(stderr, "Send error: %s\n", uv_strerror(status));
@@ -36,9 +37,10 @@ static bool sendUDP(const uint8_t *data, size_t length, ipClient &client) {
   }
   return true;
 }
+
 // 接收回调：当收到数据时被调用
 static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
-                    const struct sockaddr *addr, unsigned flags) {
+                    const sockaddr *addr, unsigned flags) {
   if (nread < 0) {
     fprintf(stderr, "Read error: %s\n", uv_err_name(nread));
     uv_close((uv_handle_t *)handle, NULL);
@@ -52,18 +54,14 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
     return;
   }
 
-  char sender_ip[17] = {0};
-  uint16_t sender_port = 0;
-  if (addr) {
-    uv_ip4_name((const struct sockaddr_in *)addr, sender_ip, 16);
-    sender_port = ntohs(((const struct sockaddr_in *)addr)->sin_port);
-  }
+  auto addr_in = (const struct sockaddr_in *)addr;
+
   NetworkPacket p;
   auto packet = (const NetworkPacket *)(buf->base);
 
   ipClient client = {
-      .ip = std::string(sender_ip),
-      .port = sender_port,
+      .ip = (uint32_t)(addr_in->sin_addr.s_addr),
+      .port = ntohs(addr_in->sin_port),
       .timestamp = packet->timestamp,
       .heartbeat = packet->timestamp,
   };
@@ -79,29 +77,24 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         .data_len = sizeof(r),
     };
     memcpy(pack.data, &r, pack.data_len);
-    sendUDP((const uint8_t *)(&pack), sizeof(pack) + pack.data_len, client);
+    sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, client.ip,
+            client.port);
     break;
   }
   case PACKET_ENTER_REQUEST: {
-    std::string ips;
     for (uint32_t i = 0; i < clients.size(); i++) {
-      auto &c = clients[i];
-      ips += c.ip + ":" + std::to_string(c.port);
-      if (i < clients.size() - 1) {
-        ips += ",";
-      }
+      NetworkEnterResponse r = {.ip = clients[i].ip, .port = clients[i].port};
+      NetworkPacket pack = {
+          .magic = 0x1234,
+          .timestamp = static_cast<uint64_t>(time(nullptr)),
+          .type = PACKET_ENTER_RESPONSE,
+          .data_len = sizeof(r),
+      };
+      memcpy(pack.data, &r, pack.data_len);
+      sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, client.ip,
+              client.port);
     }
-    // 正确的方式：动态分配足够空间
-    size_t total_size = sizeof(NetworkPacket) + ips.length();
-    NetworkPacket *pack = (NetworkPacket *)malloc(total_size);
-    pack->magic = 0x1234;
-    pack->timestamp = static_cast<uint64_t>(time(nullptr));
-    pack->type = PACKET_ENTER_RESPONSE;
-    pack->data_len = (uint16_t)ips.length();
-    memcpy(pack->data, ips.c_str(), pack->data_len);
-    sendUDP((const uint8_t *)(pack), total_size, client);
     clients.push_back(client);
-    free(pack);
     break;
   }
   default: {
