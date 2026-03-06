@@ -88,7 +88,6 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
   case PACKET_HELLO_REQUEST: {
     NetworkHelloResponse r = {
         .heartbeat_interval = heartbeat_interval,
-        .clients_number = static_cast<uint32_t>(clients.size()),
     };
     NetworkPacket pack = {
         .magic = 0x1234,
