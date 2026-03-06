@@ -2,15 +2,32 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <flat_map>
+#include <ranges>
 #include <string>
+#include <utility>
 #include <uv.h>
-#include <vector>
 
 static uv_udp_t server_socket = {};
 static uint32_t server_port = 8888;
 static uv_loop_t *loop = nullptr;
 
-static std::vector<ipClient> clients;
+static const auto heartbeat_interval = 3;
+
+static uv_timer_t fresh_client_timer;
+
+// key:ip,port
+static std::flat_map<std::pair<uint32_t, uint16_t>, ipClient> clients;
+
+static void freshClient(uv_timer_t *handle) {
+  uint64_t now = static_cast<uint64_t>(time(nullptr));
+  std::erase_if(clients, [=](const auto &item) {
+    const auto &[key, client] = item;
+    // 检查是否超时
+    auto duration = now - client.heartbeat;
+    return duration >= heartbeat_interval * 10;
+  });
+}
 
 static bool sendUDP(uint8_t *data, size_t len, uint32_t ip, uint16_t port) {
   uv_udp_send_t *send_req = (uv_udp_send_t *)malloc(sizeof(uv_udp_send_t));
@@ -69,7 +86,10 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
   // dispatch
   switch (packet->type) {
   case PACKET_HELLO_REQUEST: {
-    NetworkHelloResponse r = {.heartbeat_interval = 5};
+    NetworkHelloResponse r = {
+        .heartbeat_interval = heartbeat_interval,
+        .clients_number = static_cast<uint32_t>(clients.size()),
+    };
     NetworkPacket pack = {
         .magic = 0x1234,
         .timestamp = static_cast<uint64_t>(time(nullptr)),
@@ -82,19 +102,39 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
     break;
   }
   case PACKET_ENTER_REQUEST: {
-    for (uint32_t i = 0; i < clients.size(); i++) {
-      NetworkEnterResponse r = {.ip = clients[i].ip, .port = clients[i].port};
-      NetworkPacket pack = {
-          .magic = 0x1234,
-          .timestamp = static_cast<uint64_t>(time(nullptr)),
-          .type = PACKET_ENTER_RESPONSE,
-          .data_len = sizeof(r),
-      };
-      memcpy(pack.data, &r, pack.data_len);
-      sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, client.ip,
-              client.port);
+    for (const auto &[ip, port] : clients | std::views::keys) {
+      {
+        NetworkEnterResponse r = {.ip = ip, .port = port};
+        NetworkPacket pack = {
+            .magic = 0x1234,
+            .timestamp = static_cast<uint64_t>(time(nullptr)),
+            .type = PACKET_ENTER_RESPONSE,
+            .data_len = sizeof(r),
+        };
+        memcpy(pack.data, &r, pack.data_len);
+        sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, client.ip,
+                client.port);
+      }
+      // send to other player
+      {
+        NetworkJoinRequest r = {.ip = client.ip, .port = client.port};
+        NetworkPacket pack = {
+            .magic = 0x1234,
+            .timestamp = static_cast<uint64_t>(time(nullptr)),
+            .type = PACKET_JOIN_REQUEST,
+            .data_len = sizeof(r),
+        };
+        memcpy(pack.data, &r, pack.data_len);
+        sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, ip, port);
+      }
     }
-    clients.push_back(client);
+    auto key = std::make_pair(client.ip, client.port);
+    clients.insert({key, client});
+    break;
+  }
+  case PACKET_HEARTBEAT_REQUEST: {
+    auto key = std::make_pair(client.ip, client.port);
+    clients[key].heartbeat = static_cast<uint64_t>(time(nullptr));
     break;
   }
   default: {
@@ -132,6 +172,11 @@ int main(int argc, char *argv[]) {
     std::abort();
   }
   printf("Started receiving on port %d...\n", server_port);
+  // 创建定时器
+  uv_timer_init(loop, &fresh_client_timer);
+  auto interval = heartbeat_interval * 1000;
+  uv_timer_start(&fresh_client_timer, freshClient, 0, interval);
+
   uv_run(loop, UV_RUN_DEFAULT);
   return 0;
 }
