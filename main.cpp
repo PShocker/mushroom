@@ -136,6 +136,10 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
     clients[key].heartbeat = static_cast<uint64_t>(time(nullptr));
     break;
   }
+  case PACKET_EXIT_REQUEST: {
+    clients.erase({client.ip, client.port});
+    break;
+  }
   default: {
     break;
   }
