@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 #include <uv.h>
+#include <vector>
 
 static uv_udp_t server_socket = {};
 static uint32_t server_port = 8888;
@@ -15,19 +16,8 @@ static uv_loop_t *loop = nullptr;
 static const auto heartbeat_interval = 3;
 
 static uv_timer_t fresh_client_timer;
-
 // key:ip,port
-static std::flat_map<std::pair<uint32_t, uint16_t>, ipClient> clients;
-
-static void freshClient(uv_timer_t *handle) {
-  uint64_t now = static_cast<uint64_t>(time(nullptr));
-  std::erase_if(clients, [=](const auto &item) {
-    const auto &[key, client] = item;
-    // 检查是否超时
-    auto duration = now - client.heartbeat;
-    return duration >= heartbeat_interval * 10;
-  });
-}
+static std::flat_map<std::pair<uint32_t, uint16_t>, NetworkClient> clients;
 
 static bool sendUDP(uint8_t *data, size_t len, uint32_t ip, uint16_t port) {
   uv_udp_send_t *send_req = (uv_udp_send_t *)malloc(sizeof(uv_udp_send_t));
@@ -55,6 +45,57 @@ static bool sendUDP(uint8_t *data, size_t len, uint32_t ip, uint16_t port) {
   return true;
 }
 
+static void dispatch(const NetworkPacket *packet) {
+  auto type = packet->type;
+  auto sub_type = packet->sub_type;
+  std::flat_set<std::pair<uint32_t, uint16_t>> cast_clients;
+  // 先找到所有订阅该事件的人
+  for (auto [key, client] : clients) {
+    if (client.registers.contains(type)) {
+      if (client.registers[type].contains(sub_type)) {
+        cast_clients.insert(key);
+      }
+    }
+  }
+  if (packet->cast_type == CAST_UNICAST) {
+    auto key = std::make_pair(packet->cast_ip, packet->cast_port);
+    if (cast_clients.contains(key)) {
+      cast_clients = {key};
+    }
+  }
+  // 发送
+  for (const auto &[ip, port] : cast_clients) {
+    sendUDP((uint8_t *)(packet), sizeof(NetworkPacket) + packet->data_len, ip,
+            port);
+  }
+}
+
+static void clientFresh(uv_timer_t *handle) {
+  std::vector<std::pair<uint32_t, uint16_t>> r;
+  uint64_t now = static_cast<uint64_t>(time(nullptr));
+  for (auto [k, v] : clients) {
+    auto duration = now - v.heartbeat;
+    if (duration >= heartbeat_interval * 3) {
+      r.push_back(k);
+    }
+  }
+  for (auto key : r) {
+    auto client = clients[key];
+    clients.erase(key);
+    // 触发bye事件，广播
+    NetworkByeResponse r = {.ip = key.first, .port = key.second};
+    auto *packet = (NetworkPacket *)malloc(sizeof(NetworkPacket) + sizeof(r));
+    packet->magic = 0x1234;
+    packet->timestamp = static_cast<uint64_t>(time(nullptr));
+    packet->type = PACKET_BYE_RESPONSE;
+    packet->sub_type = clients[key].scene;
+    packet->data_len = sizeof(r);
+    memcpy(packet->data, &r, packet->data_len);
+    dispatch(packet);
+    free(packet);
+  }
+}
+
 // 接收回调：当收到数据时被调用
 static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
                     const sockaddr *addr, unsigned flags) {
@@ -76,59 +117,28 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
   NetworkPacket p;
   auto packet = (const NetworkPacket *)(buf->base);
 
-  ipClient client = {
+  NetworkClient client = {
       .ip = (uint32_t)(addr_in->sin_addr.s_addr),
       .port = ntohs(addr_in->sin_port),
       .timestamp = packet->timestamp,
-      .heartbeat = packet->timestamp,
   };
 
   // dispatch
   switch (packet->type) {
   case PACKET_HELLO_REQUEST: {
-    NetworkHelloResponse r = {
-        .heartbeat_interval = heartbeat_interval,
-    };
-    NetworkPacket pack = {
-        .magic = 0x1234,
-        .timestamp = static_cast<uint64_t>(time(nullptr)),
-        .type = PACKET_HELLO_RESPONSE,
-        .data_len = sizeof(r),
-    };
-    memcpy(pack.data, &r, pack.data_len);
-    sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, client.ip,
-            client.port);
-    break;
-  }
-  case PACKET_ENTER_REQUEST: {
-    for (const auto &[ip, port] : clients | std::views::keys) {
-      {
-        NetworkEnterResponse r = {.ip = ip, .port = port};
-        NetworkPacket pack = {
-            .magic = 0x1234,
-            .timestamp = static_cast<uint64_t>(time(nullptr)),
-            .type = PACKET_ENTER_RESPONSE,
-            .data_len = sizeof(r),
-        };
-        memcpy(pack.data, &r, pack.data_len);
-        sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, client.ip,
-                client.port);
-      }
-      // send to other player
-      {
-        NetworkJoinRequest r = {.ip = client.ip, .port = client.port};
-        NetworkPacket pack = {
-            .magic = 0x1234,
-            .timestamp = static_cast<uint64_t>(time(nullptr)),
-            .type = PACKET_JOIN_REQUEST,
-            .data_len = sizeof(r),
-        };
-        memcpy(pack.data, &r, pack.data_len);
-        sendUDP((uint8_t *)(&pack), sizeof(pack) + pack.data_len, ip, port);
-      }
-    }
+    NetworkHelloResponse r = {.heartbeat_interval = heartbeat_interval};
+    auto data_len = sizeof(NetworkHelloResponse);
+    auto packet = (NetworkPacket *)malloc(sizeof(NetworkPacket) + data_len);
+    packet->magic = 0x1234;
+    packet->timestamp = static_cast<uint64_t>(time(nullptr));
+    packet->type = PACKET_HELLO_RESPONSE;
+    packet->data_len = data_len;
+    memcpy(packet->data, &r, data_len);
+    sendUDP((uint8_t *)(packet), sizeof(NetworkPacket) + packet->data_len,
+            client.ip, client.port);
     auto key = std::make_pair(client.ip, client.port);
     clients.insert({key, client});
+    free(packet);
     break;
   }
   case PACKET_HEARTBEAT_REQUEST: {
@@ -136,14 +146,36 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
     clients[key].heartbeat = static_cast<uint64_t>(time(nullptr));
     break;
   }
-  case PACKET_EXIT_REQUEST: {
-    clients.erase({client.ip, client.port});
+  case PACKET_BYE_REQUEST: {
+    auto key = std::make_pair(client.ip, client.port);
+    clients.erase(key);
+    break;
+  }
+  case PACKET_REGISTER_REQUEST: {
+    auto r = (const NetworkRegisterRequest *)packet->data;
+    auto key = std::make_pair(client.ip, client.port);
+    clients[key].registers[r->type].insert(r->sub_type);
+    break;
+  }
+  case PACKET_UNREGISTER_REQUEST: {
+    auto r = (const NetworkRegisterRequest *)packet->data;
+    auto key = std::make_pair(client.ip, client.port);
+    clients[key].registers[r->type].erase(r->sub_type);
+    break;
+  }
+  case PACKET_HOST_REQUEST: {
+    auto r = (const NetworkHostRequest *)packet->data;
+    for (auto [k, v] : clients) {
+      r->scene;
+    }
     break;
   }
   default: {
     break;
   }
   }
+
+  dispatch(packet);
 
   free(buf->base); // 释放由 alloc_cb 分配的内存
 }
@@ -178,7 +210,7 @@ int main(int argc, char *argv[]) {
   // 创建定时器
   uv_timer_init(loop, &fresh_client_timer);
   auto interval = heartbeat_interval * 1000;
-  uv_timer_start(&fresh_client_timer, freshClient, 0, interval);
+  uv_timer_start(&fresh_client_timer, clientFresh, 0, interval);
 
   uv_run(loop, UV_RUN_DEFAULT);
   return 0;
