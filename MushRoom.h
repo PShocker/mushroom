@@ -35,7 +35,6 @@ struct NetworkClient {
   std::flat_map<uint16_t, std::flat_set<uint8_t>> registers;
   uint32_t scene;
   bool host;
-  std::flat_set<uint32_t> scenes;
 };
 
 struct NetworkHelloRequest {
@@ -68,6 +67,12 @@ struct NetworkUnRegisterRequest {
 
 struct NetworkHostRequest {
   uint32_t scene;
+};
+
+struct NetworkHostResponse {
+  uint32_t ip;
+  uint16_t port;
+  uint8_t data[];
 };
 
 struct NetworkPacket {

@@ -18,6 +18,7 @@ static const auto heartbeat_interval = 3;
 static uv_timer_t fresh_client_timer;
 // key:ip,port
 static std::flat_map<std::pair<uint32_t, uint16_t>, NetworkClient> clients;
+static std::flat_map<uint32_t, std::vector<uint8_t>> host_datas;
 
 static bool sendUDP(uint8_t *data, size_t len, uint32_t ip, uint16_t port) {
   uv_udp_send_t *send_req = (uv_udp_send_t *)malloc(sizeof(uv_udp_send_t));
@@ -164,11 +165,40 @@ static void on_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
     break;
   }
   case PACKET_HOST_REQUEST: {
+    uint32_t ip = client.ip;
+    uint16_t port = client.port;
     auto r = (const NetworkHostRequest *)packet->data;
     for (auto [k, v] : clients) {
-      r->scene;
+      if (v.host && v.scene == r->scene) {
+        ip = v.ip;
+        port = v.port;
+        break;
+      }
     }
+    std::vector<uint8_t> host_data = {};
+    if (host_datas.contains(r->scene)) {
+      host_data = host_datas.at(r->scene);
+    }
+    auto data_len = sizeof(NetworkHostResponse) + host_data.size();
+    auto r2 = (NetworkHostResponse *)malloc(data_len);
+    r2->ip = ip;
+    r2->port = port;
+    memcpy(r2->data, host_data.data(), host_data.size());
+
+    auto packet = (NetworkPacket *)malloc(sizeof(NetworkPacket) + data_len);
+    packet->magic = 0x1234;
+    packet->timestamp = static_cast<uint64_t>(time(nullptr));
+    packet->type = PACKET_HOST_RESPONSE;
+    packet->data_len = data_len;
+    memcpy(packet->data, r2, data_len);
+    sendUDP((uint8_t *)(packet), sizeof(NetworkPacket) + packet->data_len,
+            client.ip, client.port);
+    free(packet);
+    free(r2);
     break;
+  }
+  case PACKET_UNHOST_REQUEST: {
+    
   }
   default: {
     break;
